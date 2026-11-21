@@ -1,0 +1,18 @@
+{
+  "command": "node",
+  "args": ["main.mjs"],
+  "restart_policy": "always",
+  "display_name": "多来源用量监控",
+  "description": "基于 Usage & Speed Monitor (usage-monitor) 的多来源账单扩展【需先安装 usage-monitor】。支持按多账号、Vertex API 与项目分账，支持部分来源勾选、分钟级自定义时段及 Gemini/Claude 倍率折算，并与原插件实时对账。",
+  "has_web_ui": true,
+  "ui_config": {
+    "display_name": "多来源用量监控",
+    "views": [
+      {
+        "path": "/",
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
+        "title": "多来源用量监控"
+      }
+    ]
+  }
+}
