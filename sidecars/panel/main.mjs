@@ -13,17 +13,21 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+const PLUGIN_ROOT = dirname(dirname(HERE));
 const ENGINE_PATH = join(HERE, 'ledger-engine.mjs');
+const UPDATER_PATH = join(HERE, 'updater.mjs');
 const NO_STORE = { 'Cache-Control': 'no-store, no-cache, must-revalidate' };
 
 let cachedEngineMtime = -1;
 let cachedEngineMod = null;
+let cachedUpdaterMtime = -1;
+let cachedUpdaterMod = null;
 
 function computeUiVersion() {
   let max = 0;
-  for (const name of ['index.html', 'styles.css', 'app.js']) {
+  for (const p of [join(PLUGIN_ROOT, 'plugin.json'), join(HERE, 'index.html'), join(HERE, 'styles.css'), join(HERE, 'app.js')]) {
     try {
-      const m = Math.floor(statSync(join(HERE, name)).mtimeMs || 0);
+      const m = Math.floor(statSync(p).mtimeMs || 0);
       if (m > max) max = m;
     } catch {}
   }
@@ -41,6 +45,23 @@ async function getEngine() {
     cachedEngineMtime = mtime;
   }
   return cachedEngineMod;
+}
+
+async function getUpdater() {
+  let mtime = 0;
+  try {
+    mtime = Math.floor(statSync(UPDATER_PATH).mtimeMs || 0);
+  } catch {}
+  if (!cachedUpdaterMod || mtime !== cachedUpdaterMtime) {
+    const url = `${pathToFileURL(UPDATER_PATH).href}?v=${mtime || Date.now()}`;
+    cachedUpdaterMod = await import(url);
+    cachedUpdaterMod.registerHotRestartHandler?.(() => {
+      cachedEngineMtime = -1;
+      cachedUpdaterMtime = -1;
+    });
+    cachedUpdaterMtime = mtime;
+  }
+  return cachedUpdaterMod;
 }
 
 async function readAsset(name) {
@@ -74,7 +95,12 @@ async function handleGetLedger(data = {}) {
 
 async function handleUpdateConfig(data = {}) {
   const engine = await getEngine();
-  return engine.mutateLedgerConfig(data);
+  return await engine.mutateLedgerConfig(data);
+}
+
+async function handlePluginUpdate(data = {}) {
+  const updater = await getUpdater();
+  return await updater.handleUpdaterAction(data);
 }
 
 async function readLogoSvg() {
@@ -105,6 +131,8 @@ async function startSidecarMode() {
   app.api('/api/ledger', (data) => handleGetLedger(data), 'GET');
   app.api('/api/ledger', (data) => handleGetLedger(data), 'POST');
   app.api('/api/config', (data) => handleUpdateConfig(data), 'POST');
+  app.api('/api/update', (data) => handlePluginUpdate(data), 'GET');
+  app.api('/api/update', (data) => handlePluginUpdate(data), 'POST');
 
   await app.run();
 }
@@ -156,6 +184,16 @@ async function startStandaloneFallback(port = 51888) {
         let body = '';
         for await (const chunk of req) body += chunk;
         const out = await handleUpdateConfig(body ? JSON.parse(body) : {});
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', ...NO_STORE });
+        res.end(JSON.stringify(out));
+        return;
+      }
+      if (url.pathname === '/api/update') {
+        let body = '';
+        for await (const chunk of req) body += chunk;
+        const params = Object.fromEntries(url.searchParams.entries());
+        if (body) Object.assign(params, JSON.parse(body));
+        const out = await handlePluginUpdate(params);
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', ...NO_STORE });
         res.end(JSON.stringify(out));
         return;

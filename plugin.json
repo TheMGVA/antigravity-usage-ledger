@@ -1,7 +1,7 @@
 {
   "name": "usage-ledger",
   "displayName": "多来源用量监控",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "基于 Usage & Speed Monitor (usage-monitor) 的多来源账单扩展插件【请先安装并启用 usage-monitor，再安装本插件】。自动拆分多账号、试用/正式订阅、Vertex API 与项目费用，支持 Gemini/Claude 分列与倍率折算，并与原插件实时核对总账。",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [

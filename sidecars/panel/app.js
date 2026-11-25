@@ -38,6 +38,10 @@
     splitFamilyCosts: true,
     geminiMultiplier: 1,
     claudeMultiplier: 3,
+    autoInstallUpdates: false,
+    showUpdatePanel: false,
+    checkingUpdate: false,
+    installingUpdate: false,
     prefsHydrated: false,
     editingSourceId: null,
     editingRuleId: null,
@@ -46,6 +50,7 @@
     expandedProjects: new Set(),
     expandedConvs: new Set(),
     bootUiVersion: null,
+    bootPluginVersion: null,
     data: null,
     loading: false,
     error: null,
@@ -213,6 +218,7 @@
               convSortBy: state.convSortBy,
               convSortDir: state.convSortDir,
               convViewMode: state.convViewMode,
+              autoInstallUpdates: state.autoInstallUpdates,
             },
           }),
         });
@@ -253,6 +259,14 @@
       const res = await apiFetch(`/api/ledger?${q.toString()}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
+      if (json.pluginVersion) {
+        if (state.bootPluginVersion && state.bootPluginVersion !== json.pluginVersion) {
+          showToast(`已自动更新至 v${json.pluginVersion}，正在刷新…`);
+          setTimeout(() => window.location.reload(), 400);
+          return;
+        }
+        state.bootPluginVersion = json.pluginVersion;
+      }
       if (json.uiVersion) {
         if (state.bootUiVersion && state.bootUiVersion !== json.uiVersion) {
           window.location.reload();
@@ -274,6 +288,7 @@
         if (dp.convSortBy) state.convSortBy = dp.convSortBy;
         if (dp.convSortDir === 'asc' || dp.convSortDir === 'desc') state.convSortDir = dp.convSortDir;
         if (dp.convViewMode === 'projects' || dp.convViewMode === 'list') state.convViewMode = dp.convViewMode;
+        state.autoInstallUpdates = dp.autoInstallUpdates === true;
         state.prefsHydrated = true;
       }
       state.data = json;
@@ -1391,6 +1406,57 @@
     `;
   }
 
+  function renderUpdatePanel(d) {
+    if (!state.showUpdatePanel) return '';
+    const upd = d?.pluginUpdate || {};
+    const curVer = upd.currentVersion || d?.pluginVersion || '1.6.0';
+    const latestVer = upd.latestVersion || curVer;
+    const hasUpdate = Boolean(upd.hasUpdate);
+    const isBusy = Boolean(state.installingUpdate || upd.updating);
+    const checkedText = upd.checkedAtMs > 0 ? `上次检查 ${fmtTimeShort(upd.checkedAtMs)}` : '尚未检查';
+
+    return `
+      <div class="update-panel">
+        <div class="update-panel-head">
+          <div class="update-panel-info">
+            <div class="update-panel-title">
+              <span>插件版本与自动更新</span>
+              <span class="tag">当前 v${esc(curVer)}</span>
+              ${
+                hasUpdate
+                  ? `<span class="tag tag-update-ready">发现新版本 v${esc(latestVer)}</span>`
+                  : `<span class="tag tag-live">✓ 已是最新 (v${esc(latestVer)})</span>`
+              }
+            </div>
+            <div class="update-panel-meta">
+              <span>${esc(checkedText)}</span>
+              ${upd.error ? `<span style="color:var(--warn)"> · ${esc(upd.error)}</span>` : ''}
+            </div>
+          </div>
+          <button type="button" class="btn btn-ghost" data-action="toggle-update-panel">✕</button>
+        </div>
+        <div class="update-panel-controls">
+          <label class="switch-label">
+            <input type="checkbox" id="toggle-auto-update" ${state.autoInstallUpdates ? 'checked' : ''}>
+            <span>检测到新版本时自动下载安装并重启</span>
+          </label>
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            <button type="button" class="btn" data-action="check-update" ${state.checkingUpdate || isBusy ? 'disabled' : ''}>
+              ${state.checkingUpdate ? '正在检查…' : '检查更新'}
+            </button>
+            ${
+              hasUpdate
+                ? `<button type="button" class="btn btn-primary" data-action="perform-update" ${isBusy ? 'disabled' : ''}>
+                    ${isBusy ? '⏳ 正在下载安装…' : `⬆️ 下载安装 v${esc(latestVer)} 并重启`}
+                  </button>`
+                : ''
+            }
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
   function render() {
     const root = document.getElementById('app');
     if (!root) return;
@@ -1405,6 +1471,11 @@
     const accText = d?.hostAccount?.email
       ? `${d.hostAccount.email}${activePlanLabel ? ` · ${activePlanLabel}` : ''}`
       : '自动同步本机用量';
+
+    const upd = d?.pluginUpdate || {};
+    const curVer = upd.currentVersion || d?.pluginVersion || '';
+    const hasUpdate = Boolean(upd.hasUpdate);
+    const isUpdating = Boolean(state.installingUpdate || upd.updating);
 
     let mainBody = '';
     if (!d && state.loading) {
@@ -1431,11 +1502,27 @@
               </svg>
             </span>
             <div class="brand-text-col">
-              <span class="brand-title">多来源用量监控</span>
+              <div class="brand-title-row">
+                <span class="brand-title">多来源用量监控</span>
+                ${
+                  curVer
+                    ? `<button type="button" class="ver-pill ${hasUpdate ? 'has-update' : ''} ${state.showUpdatePanel ? 'active' : ''}" data-action="toggle-update-panel" title="点击打开版本检查与自动更新设置">
+                        v${esc(curVer)}${hasUpdate ? '<span class="ver-dot"></span>' : ''}
+                      </button>`
+                    : ''
+                }
+              </div>
               <span class="brand-sub">${esc(accText)}</span>
             </div>
           </div>
           <div class="topbar-right">
+            ${
+              hasUpdate
+                ? `<button type="button" class="btn btn-update-cta" data-action="perform-update" ${isUpdating ? 'disabled' : ''} title="一键下载安装 v${esc(upd.latestVersion)} 并重启面板">
+                    ${isUpdating ? '⏳ 更新中…' : `⬆️ 更新 v${esc(upd.latestVersion)}`}
+                  </button>`
+                : ''
+            }
             <div class="seg-tabs">
               <button class="seg-tab ${state.tab === 'dashboard' ? 'active' : ''}" data-action="switch-tab" data-tab="dashboard">总览</button>
               <button class="seg-tab ${state.tab === 'rules' ? 'active' : ''}" data-action="switch-tab" data-tab="rules">时段拆分</button>
@@ -1444,6 +1531,7 @@
             <button class="btn" data-action="reload-page" title="同步最新数据并刷新页面">↻</button>
           </div>
         </div>
+        ${renderUpdatePanel(d)}
         ${mainBody}
       </div>
     `;
@@ -1573,6 +1661,94 @@
       state.range = btn.dataset.range || 'all';
       render();
       await loadLedger({ force: false, allowRenderWhileEditing: true });
+      return;
+    }
+
+    if (action === 'toggle-update-panel') {
+      state.showUpdatePanel = !state.showUpdatePanel;
+      render();
+      if (state.showUpdatePanel && (!state.data?.pluginUpdate?.checkedAtMs)) {
+        state.checkingUpdate = true;
+        render();
+        try {
+          const res = await apiFetch('/api/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'check_update', force: true }),
+          });
+          const out = await res.json();
+          if (state.data && out) {
+            state.data.pluginUpdate = { ...(state.data.pluginUpdate || {}), ...out };
+          }
+        } catch {} finally {
+          state.checkingUpdate = false;
+          render();
+        }
+      }
+      return;
+    }
+
+    if (action === 'check-update') {
+      if (state.checkingUpdate) return;
+      state.checkingUpdate = true;
+      render();
+      try {
+        const res = await apiFetch('/api/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'check_update', force: true }),
+        });
+        const out = await res.json();
+        if (state.data && out) {
+          state.data.pluginUpdate = { ...(state.data.pluginUpdate || {}), ...out };
+        }
+        if (out?.error) {
+          showToast(`检查更新失败: ${out.error}`);
+        } else if (out?.hasUpdate) {
+          showToast(`发现新版本 v${out.latestVersion}`);
+        } else {
+          showToast(`当前已是最新版本 v${out?.currentVersion || ''}`);
+        }
+      } catch (err) {
+        showToast(err?.message || '检查更新失败');
+      } finally {
+        state.checkingUpdate = false;
+        render();
+      }
+      return;
+    }
+
+    if (action === 'perform-update') {
+      if (state.installingUpdate) return;
+      state.installingUpdate = true;
+      render();
+      showToast('正在从 GitHub 下载并校验新版本…');
+      try {
+        const res = await apiFetch('/api/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'perform_update' }),
+        });
+        const out = await res.json();
+        if (!res.ok || out?.ok === false) {
+          throw new Error(out?.error || '更新安装失败');
+        }
+        if (!out.updated) {
+          showToast(out.message || '当前已是最新版本');
+          state.installingUpdate = false;
+          await loadLedger({ force: true, allowRenderWhileEditing: true });
+          render();
+          return;
+        }
+        showToast(out.message || `✓ 已更新至 v${out.currentVersion}，正在重启面板…`);
+        setTimeout(() => {
+          window.location.reload();
+        }, 550);
+      } catch (err) {
+        state.installingUpdate = false;
+        showToast(err?.message || '更新失败');
+        render();
+      }
       return;
     }
 
@@ -1896,6 +2072,13 @@
     if (t.id === 'toggle-vertex-std') {
       state.showVertexStandard = Boolean(t.checked);
       persistDisplayPrefsDebounced();
+      render();
+      return;
+    }
+    if (t.id === 'toggle-auto-update') {
+      state.autoInstallUpdates = Boolean(t.checked);
+      persistDisplayPrefsDebounced();
+      showToast(state.autoInstallUpdates ? '已开启新版本自动下载安装' : '已切换为手动确认更新');
       render();
       return;
     }

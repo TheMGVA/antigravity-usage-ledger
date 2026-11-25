@@ -5,19 +5,67 @@
  * `usage-monitor` telemetry on any machine (macOS / Windows / Linux) without hardcoded accounts.
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = dirname(dirname(HERE));
 const FALLBACK_CATALOG_FILE = join(PLUGIN_ROOT, 'pricing-catalog.fallback.json');
+const PLUGIN_MANIFEST_FILE = join(PLUGIN_ROOT, 'plugin.json');
+const UPDATER_FILE = join(HERE, 'updater.mjs');
 
-const MODEL_IDENTITY_VERSION = 2;
 const COMPACTION_QUOTA_SETTLE_MAX_MS = 180_000;
 const STEP_QUOTA_DURATION_CAP_SEC = 600;
 const AUTO_PALETTE = ['#3b82f6', '#8b5cf6', '#10b981', '#06b6d4', '#ec4899', '#6366f1', '#14b8a6'];
+
+const TSL_FLAG_COMPACTION = 1 << 0;
+const TSL_FLAG_IMAGE_GEN = 1 << 1;
+const TSL_FLAG_COMPLETE = 1 << 2;
+
+let cachedUpdaterMtime = -1;
+let cachedUpdaterMod = null;
+
+async function getUpdaterMod() {
+  let mtime = 0;
+  try {
+    if (existsSync(UPDATER_FILE)) mtime = Math.floor(statSync(UPDATER_FILE).mtimeMs || 0);
+  } catch {}
+  if (!cachedUpdaterMod || mtime !== cachedUpdaterMtime) {
+    cachedUpdaterMod = await import(`${pathToFileURL(UPDATER_FILE).href}?v=${mtime || Date.now()}`);
+    cachedUpdaterMtime = mtime;
+  }
+  return cachedUpdaterMod;
+}
+
+let cachedDatabaseSyncCtor = undefined;
+function getSqliteDatabaseSync() {
+  if (cachedDatabaseSyncCtor !== undefined) return cachedDatabaseSyncCtor;
+  const origEmitWarning = process.emitWarning;
+  try {
+    if (typeof origEmitWarning === 'function') {
+      process.emitWarning = function suppressSqliteExp(warning, ...rest) {
+        const msg = typeof warning === 'string' ? warning : String(warning?.message || '');
+        if (/SQLite is an experimental feature/i.test(msg)) return;
+        return origEmitWarning.call(this, warning, ...rest);
+      };
+    }
+    if (typeof process.getBuiltinModule === 'function') {
+      const mod = process.getBuiltinModule('node:sqlite');
+      cachedDatabaseSyncCtor = typeof mod?.DatabaseSync === 'function' ? mod.DatabaseSync : null;
+    } else {
+      cachedDatabaseSyncCtor = null;
+    }
+  } catch {
+    cachedDatabaseSyncCtor = null;
+  } finally {
+    if (typeof origEmitWarning === 'function') {
+      process.emitWarning = origEmitWarning;
+    }
+  }
+  return cachedDatabaseSyncCtor;
+}
 
 function resolveGeminiBaseDir() {
   return String(process.env.ANTIGRAVITY_GEMINI_DIR || '').trim() || join(homedir(), '.gemini');
@@ -50,6 +98,14 @@ function discoverUsageMonitorPluginDir(geminiBase) {
   return direct;
 }
 
+function hasTrajectoryStoreInDir(dir) {
+  return (
+    existsSync(join(dir, 'trajectory_store.sqlite')) ||
+    existsSync(join(dir, 'trajectory_usage_cache.json')) ||
+    existsSync(join(dir, 'trajectory_usage_cache.json.bak'))
+  );
+}
+
 function resolveUsageMonitorDataDir(geminiBase) {
   const explicit = String(process.env.USAGE_MONITOR_DATA_DIR || '').trim();
   if (explicit && existsSync(explicit)) return explicit;
@@ -67,7 +123,7 @@ function resolveUsageMonitorDataDir(geminiBase) {
         for (const sub of readdirSync(sidecarBase)) {
           if (sub !== 'usage-monitor' && sub !== 'usage-ledger') {
             const p = join(sidecarBase, sub, 'panel', 'data');
-            if (existsSync(join(p, 'trajectory_usage_cache.json'))) {
+            if (hasTrajectoryStoreInDir(p)) {
               candidates.unshift(p);
             }
           }
@@ -76,7 +132,7 @@ function resolveUsageMonitorDataDir(geminiBase) {
     } catch {}
   }
   for (const dir of candidates) {
-    if (existsSync(join(dir, 'trajectory_usage_cache.json'))) return dir;
+    if (hasTrajectoryStoreInDir(dir)) return dir;
   }
   for (const dir of candidates) {
     if (existsSync(dir)) return dir;
@@ -135,6 +191,7 @@ export const DEFAULT_DISPLAY_PREFS = {
   convSortBy: 'latest',
   convSortDir: 'desc',
   convViewMode: 'list',
+  autoInstallUpdates: false,
 };
 
 export const DEFAULT_LEDGER_CONFIG = {
@@ -172,6 +229,7 @@ function normalizeDisplayPrefs(raw) {
     convSortBy: VALID_CONV_SORT_BY.has(sortBy) ? sortBy : 'latest',
     convSortDir: sortDir,
     convViewMode: viewMode,
+    autoInstallUpdates: raw.autoInstallUpdates === true,
   };
 }
 
@@ -403,6 +461,18 @@ export function mutateLedgerConfig(data = {}) {
     return { ok: true, config: saved };
   }
 
+  if (action === 'check_update') {
+    return getUpdaterMod().then((upd) => upd.handleUpdaterAction({ action: 'check', force: data?.force !== false }));
+  }
+
+  if (action === 'perform_update') {
+    return getUpdaterMod().then(async (upd) => {
+      const res = await upd.handleUpdaterAction({ action: 'perform' });
+      cachedUpdaterMtime = -1;
+      return res;
+    });
+  }
+
   return { ok: true, config: current };
 }
 
@@ -430,6 +500,10 @@ function isValidRateTriplet(e) {
   );
 }
 
+function validImageOutputRate(val) {
+  return typeof val === 'number' && Number.isFinite(val) && val > 0 && val <= 10000 ? val : undefined;
+}
+
 function sanitizeCatalog(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const pricing = {};
@@ -437,6 +511,7 @@ function sanitizeCatalog(raw) {
     for (const [k, v] of Object.entries(raw.pricing)) {
       const key = String(k || '').trim();
       if (!key || !isValidRateTriplet(v) || typeof v.short !== 'string' || !v.short.trim() || typeof v.family !== 'string') continue;
+      const topImgOut = validImageOutputRate(v.imageOutput);
       let phases = null;
       if (Array.isArray(v.phases)) {
         const cleaned = v.phases.map((ph) => {
@@ -444,11 +519,27 @@ function sanitizeCatalog(raw) {
           const fromMs = ph.from ? parseIsoMs(String(ph.from).trim()) : -Infinity;
           const untilMs = ph.until ? parseIsoMs(String(ph.until).trim()) : Infinity;
           if ((ph.from && !(fromMs > 0)) || (ph.until && !(untilMs > 0)) || (!ph.from && !ph.until) || fromMs >= untilMs) return null;
-          return { ...(ph.from ? { from: ph.from, fromMs } : {}), ...(ph.until ? { until: ph.until, untilMs } : {}), input: ph.input, cache: ph.cache, output: ph.output };
+          const phImgOut = validImageOutputRate(ph.imageOutput);
+          return {
+            ...(ph.from ? { from: ph.from, fromMs } : {}),
+            ...(ph.until ? { until: ph.until, untilMs } : {}),
+            input: ph.input,
+            cache: ph.cache,
+            output: ph.output,
+            ...(phImgOut !== undefined ? { imageOutput: phImgOut } : {}),
+          };
         }).filter(Boolean);
         if (cleaned.length > 0) phases = cleaned;
       }
-      pricing[key] = { input: v.input, cache: v.cache, output: v.output, short: v.short.trim(), family: normalizeModelFamily(v.family), ...(phases ? { phases } : {}) };
+      pricing[key] = {
+        input: v.input,
+        cache: v.cache,
+        output: v.output,
+        ...(topImgOut !== undefined ? { imageOutput: topImgOut } : {}),
+        short: v.short.trim(),
+        family: normalizeModelFamily(v.family),
+        ...(phases ? { phases } : {}),
+      };
     }
   }
   const placeholders = {};
@@ -536,6 +627,14 @@ function formatGenericModelSlug(slug = '') {
   if (/^gemini-3-flash-(?:[abd]|agent)$/i.test(s)) return 'Gemini 3.5 Flash';
   if (/^gemini-3-flash-c$/i.test(s)) return 'Gemini 3 Flash';
   if (/^gemini-pro-(?:default|agent|b)$/i.test(s)) return 'Gemini 3.1 Pro';
+  const imgMatch = s.match(/^gemini-(\d+(?:\.\d+)?)-(pro|flash)(?:-(lite))?-image(?:-(preview))?$/i);
+  if (imgMatch) {
+    const ver = imgMatch[1];
+    const tier = imgMatch[2].charAt(0).toUpperCase() + imgMatch[2].slice(1).toLowerCase();
+    const lite = imgMatch[3] ? ' Lite' : '';
+    const prev = imgMatch[4] ? ' (Preview)' : '';
+    return `Gemini ${ver} ${tier}${lite} Image${prev}`;
+  }
   const m = s.match(/^gemini-(\d+(?:\.\d+)?)-(pro|flash|argon|carbon|neon|hydrogen|helix)(?:-(lite))?(?:-(xhigh|high|medium|low|extra-low|tiered|preview))?$/i);
   if (m) {
     const ver = m[1];
@@ -553,7 +652,11 @@ function formatGenericModelSlug(slug = '') {
   if (orchVariantMatch) {
     return `Orchestrator (${orchVariantMatch[1].charAt(0).toUpperCase() + orchVariantMatch[1].slice(1).toLowerCase()})`;
   }
+  if (/^(?:claude-opus-5[.-]5-orchestrator|orchestrator-(?:claude-)?opus-5[.-]5)$/i.test(s)) {
+    return 'Orchestrator (Opus 5.5)';
+  }
   if (/^gemini-flash-worker-agy$/i.test(s)) return 'Orchestrator Worker (Hydrogen)';
+  if (/^gemini-(?:4-)?neon-worker-agy$/i.test(s)) return 'Orchestrator Worker (Neon)';
   return '';
 }
 
@@ -569,23 +672,65 @@ function isArgonId(...parts) {
   return /argon|MODEL_PLACEHOLDER_M(?:41[789]|681)\b/i.test(text);
 }
 
+function normalizeOrchestratorVariantSlug(raw = '') {
+  let s = String(raw || '').trim().toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9.-]+/g, '-').replace(/-+/g, '-').replace(/^-+|-+$/g, '');
+  if (!s || /^worker(?:$|-)/.test(s)) return '';
+  s = s.replace(/([a-z]-)(\d+)-(\d+)(?=$|-)/g, '$1$2.$3');
+  s = s.replace(/^(?:claude|anthropic|openai)-(?=.+)/, '').replace(/^gemini-(?:4-)?(?=(?:carbon|argon|neon|hydrogen|helix)(?:$|-))/, '');
+  return s;
+}
+
+function extractExplicitOrchestratorVariant(...parts) {
+  for (const rawPart of parts) {
+    const part = String(rawPart || '').trim();
+    if (!part) continue;
+    const parenAfter = part.match(/\bOrchestrator\s*\(\s*([^)]+?)\s*\)/i);
+    if (parenAfter) {
+      const v = normalizeOrchestratorVariantSlug(parenAfter[1]);
+      if (v) return v;
+    }
+    const parenBefore = part.match(/^([a-z0-9][a-z0-9.\s-]{0,40}?)\s*\(\s*Orchestrator\s*\)(?:\s*\[[^\]]+\])?$/i);
+    if (parenBefore) {
+      const v = normalizeOrchestratorVariantSlug(parenBefore[1]);
+      if (v) return v;
+    }
+    const prefixSlug = part.match(/\b(?:gemini-pro-orchestrator|orchestrator|orch)-([a-z0-9]+(?:[.-][a-z0-9]+)*)(?=·|\s|$)/i);
+    if (prefixSlug) {
+      const v = normalizeOrchestratorVariantSlug(prefixSlug[1]);
+      if (v) return v;
+    }
+    const suffixSlug = part.match(/\b([a-z0-9]+(?:[.-][a-z0-9]+)*)-orchestrator(?=·|\s|$)/i);
+    if (suffixSlug && !/^gemini-pro$/i.test(suffixSlug[1])) {
+      const v = normalizeOrchestratorVariantSlug(suffixSlug[1]);
+      if (v) return v;
+    }
+  }
+  return '';
+}
+
 function isCarbonId(...parts) {
   const text = parts.filter(Boolean).join(' ');
   if (/\bcarbon\b|gemini-4-carbon|MODEL_PLACEHOLDER_M(?:42[79]|43[78]|667)\b/i.test(text)) return true;
-  if (/\bhydrogen\b|\bgemini-flash-worker-agy\b|MODEL_PLACEHOLDER_M(?:669|52[5678])\b/i.test(text) || isNeonId(text) || isArgonId(text)) return false;
-  const parenMatch = text.match(/\bOrchestrator\s*\(\s*([a-z0-9-]+)\s*\)/i);
-  const slugMatch = text.match(/\b(?:gemini-pro-orchestrator|orchestrator|orch)-([a-z0-9]+)\b/i);
-  const variant = parenMatch ? parenMatch[1].toLowerCase() : (slugMatch && slugMatch[1].toLowerCase() !== 'worker' ? slugMatch[1].toLowerCase() : '');
-  if (variant && variant !== 'carbon') return false;
+  if (
+    /\bhydrogen\b|\bgemini-flash-worker-agy\b|MODEL_PLACEHOLDER_M(?:669|52[5678])\b/i.test(text) ||
+    isNeonId(text) ||
+    isArgonId(text) ||
+    /\b(?:claude|anthropic|opus|sonnet|haiku|fable|gpt|openai)\b/i.test(text) ||
+    /\bOrchestrator\s+Worker\b|-worker-agy\b/i.test(text)
+  ) {
+    return false;
+  }
+  const explicitVariant = extractExplicitOrchestratorVariant(...parts);
+  if (explicitVariant && explicitVariant !== 'carbon') return false;
   return /\bgemini-pro-orchestrator\b(?![-_][a-z0-9])/i.test(text);
 }
 
-function inferFamily(rawModelKey = '', modelId = '', apiProvider = '') {
+function inferFamily(rawModelKey = '', modelId = '', apiProvider = '', displayLabel = '') {
   const prov = String(apiProvider || '').toUpperCase();
   if (prov.includes('ANTHROPIC') || prov.includes('CLAUDE')) return 'Claude';
   if (prov.includes('OPENAI') || prov.includes('GPT')) return 'GPT';
   if (prov.includes('GEMINI') || prov.includes('GOOGLE')) return 'Gemini';
-  const combined = `${rawModelKey} ${modelId}`.toUpperCase();
+  const combined = `${rawModelKey} ${modelId} ${displayLabel}`.toUpperCase();
   if (/ANTHROPIC|CLAUDE|FABLE|SONNET|OPUS|HAIKU/.test(combined)) return 'Claude';
   if (/GPT|OPENAI|\bO[134](?:[-_\s]|$)/.test(combined)) return 'GPT';
   if (/GEMINI|CARBON|ARGON|NEON|HYDROGEN|ORCHESTRATOR|HELIX|FLASH|GOOGLE/.test(combined)) return 'Gemini';
@@ -599,7 +744,15 @@ function resolvePricingAt(baseEntry, tMs) {
     const fromMs = Number.isFinite(ph.fromMs) ? ph.fromMs : -Infinity;
     const untilMs = Number.isFinite(ph.untilMs) ? ph.untilMs : Infinity;
     if (effMs >= fromMs && effMs < untilMs) {
-      return { ...baseEntry, input: ph.input, cache: ph.cache, output: ph.output, _basePricing: baseEntry };
+      const nextImgOut = ph.imageOutput ?? baseEntry.imageOutput;
+      return {
+        ...baseEntry,
+        input: ph.input,
+        cache: ph.cache,
+        output: ph.output,
+        ...(nextImgOut !== undefined ? { imageOutput: nextImgOut } : {}),
+        _basePricing: baseEntry,
+      };
     }
   }
   return baseEntry;
@@ -622,16 +775,21 @@ function createModelResolver(catalog, dynamicModelMap = new Map()) {
 
     const cleanResponseModel = responseModel && responseModel !== 'unknown' ? String(responseModel).trim() : '';
     const cleanRawFallback = rawModelKey && rawModelKey !== 'unknown' ? rawModelKey : cleanResponseModel;
-    const isWorkerSlot = rawModelKey === 'MODEL_PLACEHOLDER_M669' || /^gemini-flash-worker-agy$/i.test(cleanResponseModel);
+    const isHydrogenWorkerSlot = rawModelKey === 'MODEL_PLACEHOLDER_M669' || /^gemini-flash-worker-agy$/i.test(cleanResponseModel);
+    const isNeonWorkerSlot = /^gemini-(?:4-)?neon-worker-agy$/i.test(cleanResponseModel);
     const isVagueGenericDisplay = Boolean(
       modelDisplayName &&
         (/^gemini\s+(?:flash|pro)(?:\s+worker)?$/i.test(modelDisplayName.trim()) ||
-          (isWorkerSlot && /^gemini\s+4\s+hydrogen$/i.test(modelDisplayName.trim())))
+          (isHydrogenWorkerSlot && /^gemini\s+4\s+hydrogen$/i.test(modelDisplayName.trim())) ||
+          (isNeonWorkerSlot && /^gemini\s+(?:4\s+)?neon$/i.test(modelDisplayName.trim())))
+    );
+    const isNamedWorkerDisplay = Boolean(
+      modelDisplayName && /\bOrchestrator\s+Worker\s*\([^)]+\)/i.test(modelDisplayName)
     );
     const effectiveDisplayName =
       modelDisplayName &&
-      ((mergedLabel && (/\borchestrator\b/i.test(modelDisplayName) || isVagueGenericDisplay) && !/\borchestrator\b/i.test(mergedLabel)) ||
-        (isVagueGenericDisplay && /^gemini-flash-worker-agy$/i.test(cleanResponseModel)))
+      ((mergedLabel && ((/\borchestrator\b/i.test(modelDisplayName) && !isNamedWorkerDisplay) || isVagueGenericDisplay) && !/\borchestrator\b/i.test(mergedLabel)) ||
+        (isVagueGenericDisplay && (isHydrogenWorkerSlot || isNeonWorkerSlot)))
         ? ''
         : modelDisplayName;
     const derivedDisplay =
@@ -647,7 +805,22 @@ function createModelResolver(catalog, dynamicModelMap = new Map()) {
     const baseLabel = getBaseModelLabel(derivedDisplay);
     const canonicalSlug = baseLabel.toLowerCase().replace(/\s+/g, '-');
     const dashedSlug = canonicalSlug.replace(/\./g, '-');
+    const baseTierlessSlug = baseLabel.toLowerCase().replace(/[()]/g, ' ').trim().replace(/[^a-z0-9.]+/g, '-').replace(/^-+|-+$/g, '');
+    const baseTierlessDashedSlug = baseTierlessSlug.replace(/\./g, '-');
     const modelId = mergedModelId || (rawModelKey && rawModelKey !== 'unknown' ? rawModelKey : cleanResponseModel) || 'unknown';
+
+    const isExplicitOrchestratorDisplay = /\borchestrator\b/i.test(derivedDisplay);
+    const orchEffortStrippedSlug = isExplicitOrchestratorDisplay
+      ? tieredDashedSlug.replace(/-(?:max|xhigh|high|medium|low|thinking|extra-low|tiered|preview)$/, '')
+      : '';
+    const displayOrchestratorPricing = isExplicitOrchestratorDisplay
+      ? MODEL_PRICING[tieredSlug] ||
+        MODEL_PRICING[tieredDashedSlug] ||
+        MODEL_PRICING[baseTierlessSlug] ||
+        MODEL_PRICING[baseTierlessDashedSlug] ||
+        (orchEffortStrippedSlug ? MODEL_PRICING[orchEffortStrippedSlug] : null) ||
+        null
+      : null;
 
     const isOpaqueOrch = Boolean(cleanResponseModel && /\borchestrator\b/i.test(cleanResponseModel));
     const isBareOrch = /^gemini-pro-orchestrator$/i.test(cleanResponseModel);
@@ -656,11 +829,14 @@ function createModelResolver(catalog, dynamicModelMap = new Map()) {
     const basePricing =
       MODEL_PRICING[modelId] ||
       MODEL_PRICING[rawModelKey] ||
+      displayOrchestratorPricing ||
       (cleanResponseModel && !isOpaqueOrch ? MODEL_PRICING[cleanResponseModel] : null) ||
       MODEL_PRICING[tieredSlug] ||
       MODEL_PRICING[tieredDashedSlug] ||
       MODEL_PRICING[canonicalSlug] ||
       MODEL_PRICING[dashedSlug] ||
+      MODEL_PRICING[baseTierlessSlug] ||
+      MODEL_PRICING[baseTierlessDashedSlug] ||
       (allowOrchFallback ? MODEL_PRICING[cleanResponseModel] : null) ||
       null;
 
@@ -683,7 +859,7 @@ function createModelResolver(catalog, dynamicModelMap = new Map()) {
       label: derivedDisplay,
       baseLabel,
       shortName: derivedDisplay,
-      family: inferFamily(rawModelKey, modelId, apiProvider),
+      family: inferFamily(rawModelKey, modelId, apiProvider, derivedDisplay),
       pricing: null,
       baseCatalogPricing: null,
     };
@@ -695,11 +871,25 @@ function safeTok(val) {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
 }
 
+function resolveEffectiveOutputRate(pricing, step) {
+  if (!pricing || typeof pricing !== 'object') return 0;
+  if (
+    step?.isImageGenStep &&
+    typeof pricing.imageOutput === 'number' &&
+    Number.isFinite(pricing.imageOutput) &&
+    pricing.imageOutput > 0
+  ) {
+    return pricing.imageOutput;
+  }
+  return pricing.output;
+}
+
 function computeStepCost(step, pricing) {
   if (!pricing) return null;
+  const outRate = resolveEffectiveOutputRate(pricing, step);
   const inCost = (safeTok(step?.inputTokens) / 1_000_000) * pricing.input;
   const cacheCost = (safeTok(step?.cacheReadTokens) / 1_000_000) * pricing.cache;
-  const outCost = (safeTok(step?.outputTokens) / 1_000_000) * pricing.output;
+  const outCost = (safeTok(step?.outputTokens) / 1_000_000) * outRate;
   return inCost + cacheCost + outCost;
 }
 
@@ -708,7 +898,15 @@ function computeStandardNonPromoCost(step, basePricing) {
   let rate = basePricing;
   if (Array.isArray(basePricing.phases) && basePricing.phases.length > 0) {
     for (const ph of basePricing.phases) {
-      if (ph.input > rate.input) rate = ph;
+      if (ph.input > rate.input) {
+        rate = {
+          ...basePricing,
+          input: ph.input,
+          cache: ph.cache,
+          output: ph.output,
+          ...(ph.imageOutput !== undefined ? { imageOutput: ph.imageOutput } : {}),
+        };
+      }
     }
   }
   return computeStepCost(step, rate);
@@ -716,11 +914,12 @@ function computeStandardNonPromoCost(step, basePricing) {
 
 function normalizeStep(step) {
   if (!step || typeof step !== 'object' || Array.isArray(step)) return null;
-  if (step.modelIdentityVersion !== MODEL_IDENTITY_VERSION) {
+  const idVer = Number(step.modelIdentityVersion);
+  if (!(idVer >= 1)) {
     const ambiguous = !step.modelKey || step.modelKey === 'MODEL_PLACEHOLDER_M418';
     return {
       ...step,
-      modelIdentityVersion: MODEL_IDENTITY_VERSION,
+      modelIdentityVersion: 1,
       ...(ambiguous
         ? { legacyModelKey: step.modelKey || null, modelKey: 'unknown', modelDisplayName: '', modelSource: 'legacy_unverified' }
         : { modelSource: 'legacy_explicit' }),
@@ -849,7 +1048,27 @@ async function fetchLiveUsageMonitorOverlay(diskEntries, force = false) {
     if (!ac || typeof ac !== 'object') return;
     const rootCid = String(ac.cascadeId || rootCidFallback || '').toLowerCase();
     if (!rootCid) return;
-    const combinedRecent = Array.isArray(ac.recentSteps) ? ac.recentSteps : [];
+    const mainRecent = Array.isArray(ac.recentSteps) ? ac.recentSteps : [];
+    const combinedRecent = [...mainRecent];
+    const seenSubAgentCids = new Set(
+      mainRecent
+        .map((s) => String(s?.agentCascadeId || '').toLowerCase())
+        .filter((id) => id && id !== rootCid)
+    );
+    if (Array.isArray(ac.agents)) {
+      for (const ag of ac.agents) {
+        if (!ag || ag.isMain) continue;
+        const agFallbackCid = String(ag.cascadeId || ag.agentCascadeId || ag.id || '').toLowerCase();
+        if (agFallbackCid && seenSubAgentCids.has(agFallbackCid)) continue;
+        const agSteps = Array.isArray(ag.recentSteps) ? ag.recentSteps : [];
+        for (const s of agSteps) {
+          if (!s || typeof s !== 'object') continue;
+          combinedRecent.push(
+            s.agentCascadeId || !agFallbackCid ? s : { ...s, agentCascadeId: agFallbackCid }
+          );
+        }
+      }
+    }
     if (!combinedRecent.length) return;
 
     const stepsByAgentCid = new Map();
@@ -866,26 +1085,54 @@ async function fetchLiveUsageMonitorOverlay(diskEntries, force = false) {
 
     for (const [agCid, revSteps] of stepsByAgentCid.entries()) {
       const diskEntry = diskByCid.get(agCid);
-      if (diskEntry && diskEntry.steps.length >= revSteps.length) continue;
       const prevByIdx = new Map();
+      let maxDiskIdx = -1;
+      let maxDiskMs = 0;
       for (const ps of diskEntry?.steps || []) {
-        if (Number.isFinite(Number(ps?.stepIndex))) prevByIdx.set(Number(ps.stepIndex), ps);
+        const idxNum = Number(ps?.stepIndex);
+        if (Number.isFinite(idxNum)) {
+          prevByIdx.set(idxNum, ps);
+          if (idxNum > maxDiskIdx) maxDiskIdx = idxNum;
+        }
+        const msNum = Number(ps?.createdAtMs || 0);
+        if (msNum > maxDiskMs) maxDiskMs = msNum;
       }
-      const entryOwner = diskEntry?.accountName || liveEmail;
+
       const sortedRaw = revSteps
         .slice()
         .sort((a, b) => (Number(a?.stepIndex ?? 0) - Number(b?.stepIndex ?? 0)) || (Number(a?.createdAtMs ?? 0) - Number(b?.createdAtMs ?? 0)));
-      const chronSteps = inferCompactionSteps(
-        sortedRaw.map((s) => {
-          const norm = normalizeStep(s);
-          const prev = Number.isFinite(Number(s?.stepIndex)) ? prevByIdx.get(Number(s.stepIndex)) : null;
-          const owner = prev?.accountName || (prev ? entryOwner : (liveEmail || entryOwner));
-          if (owner && owner !== entryOwner) {
-            return { ...norm, accountName: owner };
-          }
-          return norm;
-        }).filter(Boolean)
-      );
+
+      const hasNewerStep = !diskEntry || sortedRaw.length > diskEntry.steps.length || sortedRaw.some((s) => {
+        const sIdx = Number(s?.stepIndex);
+        if (Number.isFinite(sIdx) && maxDiskIdx >= 0) return sIdx > maxDiskIdx;
+        return Number(s?.createdAtMs || 0) > maxDiskMs;
+      });
+      if (!hasNewerStep) continue;
+
+      const entryOwner = diskEntry?.accountName || liveEmail;
+      const mappedLiveSteps = sortedRaw.map((s) => {
+        const norm = normalizeStep(s);
+        const prev = Number.isFinite(Number(s?.stepIndex)) ? prevByIdx.get(Number(s.stepIndex)) : null;
+        const owner = prev?.accountName || s?.accountName || (prev ? entryOwner : (liveEmail || entryOwner));
+        if (owner && owner !== entryOwner) {
+          return { ...norm, accountName: owner };
+        }
+        return norm;
+      }).filter(Boolean);
+
+      let mergedRawSteps = mappedLiveSteps;
+      if (diskEntry?.steps?.length && mappedLiveSteps.length < diskEntry.steps.length) {
+        const firstLiveIdx = Number(mappedLiveSteps[0]?.stepIndex);
+        const firstLiveMs = Number(mappedLiveSteps[0]?.createdAtMs || 0);
+        const headSteps = diskEntry.steps.filter((ds) => {
+          const dIdx = Number(ds?.stepIndex);
+          if (Number.isFinite(dIdx) && Number.isFinite(firstLiveIdx)) return dIdx < firstLiveIdx;
+          return firstLiveMs > 0 && Number(ds?.createdAtMs || 0) < firstLiveMs;
+        });
+        mergedRawSteps = [...headSteps, ...mappedLiveSteps];
+      }
+
+      const chronSteps = inferCompactionSteps(mergedRawSteps);
       overlayByCid.set(agCid, {
         cid: agCid,
         groupCid: rootCid,
@@ -902,18 +1149,23 @@ async function fetchLiveUsageMonitorOverlay(diskEntries, force = false) {
 
   ingestActiveConversation(base.activeConversation);
   const activeRootLower = String(base?.activeConversation?.cascadeId || '').toLowerCase();
-  const runningList = Array.isArray(base?.runningConversations) ? base.runningConversations : [];
-  const needExtraConvs = runningList.filter((rc) => {
+  const candidateConvs = [
+    ...(Array.isArray(base?.runningConversations) ? base.runningConversations : []),
+    ...(Array.isArray(base?.conversations) ? base.conversations.slice(0, 16) : []),
+  ];
+  const seenCandIds = new Set();
+  const needExtraConvs = candidateConvs.filter((rc) => {
     const rcid = String(rc?.cascadeId || '').toLowerCase();
-    if (!rcid || rcid === activeRootLower) return false;
-    const liveTotal = Number(rc?.totalStepCount || rc?.stepCount || 0);
+    if (!rcid || rcid === activeRootLower || seenCandIds.has(rcid)) return false;
+    seenCandIds.add(rcid);
+    const liveTotal = Number(rc?.totalStepCount ?? rc?.stepCount ?? 0);
     const diskTotal = diskStepsByGroup.get(rcid) || 0;
     return liveTotal > diskTotal;
   });
 
   if (needExtraConvs.length > 0) {
     const extras = await Promise.all(
-      needExtraConvs.slice(0, 4).map((rc) => fetchUmJson(`/api/telemetry?conv=${encodeURIComponent(rc.cascadeId)}`))
+      needExtraConvs.slice(0, 8).map((rc) => fetchUmJson(`/api/telemetry?conv=${encodeURIComponent(rc.cascadeId)}`))
     );
     for (let i = 0; i < extras.length; i++) {
       if (extras[i]?.activeConversation) {
@@ -953,26 +1205,170 @@ function refreshLiveDiskIds(nowMs) {
   return ids;
 }
 
-function loadNormalizedEntries(trajCacheFile) {
-  let sig = '';
-  for (const p of [trajCacheFile, ...DEEP_STATS_CANDIDATES]) {
+function isSqliteHeaderReady(dbPath) {
+  if (!dbPath || !existsSync(dbPath)) return false;
+  let fd = -1;
+  try {
+    const st = statSync(dbPath);
+    if (!st || st.size < 4096) return false;
+    fd = openSync(dbPath, 'r');
+    const buf = Buffer.allocUnsafe(16);
+    const n = readSync(fd, buf, 0, 16, 0);
+    return n === 16 && buf.toString('latin1', 0, 16) === 'SQLite format 3\0';
+  } catch {
+    return false;
+  } finally {
+    if (fd >= 0) {
+      try { closeSync(fd); } catch {}
+    }
+  }
+}
+
+function decodeAccountingTupleStep(rawTuple, turnIndex = null, turnPrompt = '') {
+  if (!Array.isArray(rawTuple)) {
+    return rawTuple && typeof rawTuple === 'object' ? rawTuple : null;
+  }
+  const t = rawTuple;
+  const flags = Number(t[2] || 0);
+  const step = {
+    stepIndex: t[0] ?? null,
+    createdAtMs: Number(t[1] || 0),
+    isCompactionStep: Boolean(flags & TSL_FLAG_COMPACTION),
+    ...(flags & TSL_FLAG_IMAGE_GEN ? { isImageGenStep: true } : {}),
+    isComplete: Boolean(flags & TSL_FLAG_COMPLETE),
+    modelKey: t[3] || '',
+    responseModel: t[4] || '',
+    apiProvider: t[5] || '',
+    modelDisplayName: t[6] || '',
+    modelSource: t[7] || '',
+    modelIdentityVersion: t[8] ?? 1,
+    inputTokens: Number(t[9] || 0),
+    cacheReadTokens: Number(t[10] || 0),
+    outputTokens: Number(t[11] || 0),
+    thinkingTokens: Number(t[12] || 0),
+    responseTokens: Number(t[13] || 0),
+    totalDurationSec: t[14] ?? null,
+  };
+  if (t[19]) step.accountName = String(t[19]);
+  if (turnIndex !== null && turnIndex !== undefined) step.turnIndex = turnIndex;
+  if (turnPrompt) step.turnPromptClean = String(turnPrompt);
+  return step;
+}
+
+function readSqliteTrajectoryEntries(sqliteFile, byLower) {
+  if (!isSqliteHeaderReady(sqliteFile)) return false;
+  const DatabaseSync = getSqliteDatabaseSync();
+  if (!DatabaseSync) return false;
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let db = null;
     try {
-      if (existsSync(p)) {
+      db = new DatabaseSync(sqliteFile, { open: true, readOnly: true });
+      db.exec('PRAGMA busy_timeout = 1500;');
+      const convRows = db
+        .prepare('SELECT cascade_id, lower_id, is_archived, meta_json FROM conversations')
+        .all();
+
+      let stepRows;
+      let usedJsonExtract = true;
+      try {
+        stepRows = db
+          .prepare(`
+            SELECT
+              cascade_id,
+              pos,
+              accounting_json,
+              CASE WHEN detail_json IS NOT NULL THEN json_extract(detail_json, '$.turnIndex') ELSE NULL END AS turn_index,
+              CASE WHEN detail_json IS NOT NULL THEN COALESCE(json_extract(detail_json, '$.turnPromptClean'), json_extract(detail_json, '$.turnPrompt')) ELSE NULL END AS turn_prompt
+            FROM steps
+            ORDER BY cascade_id, pos ASC
+          `)
+          .all();
+      } catch {
+        usedJsonExtract = false;
+        stepRows = db
+          .prepare('SELECT cascade_id, pos, accounting_json, detail_json FROM steps ORDER BY cascade_id, pos ASC')
+          .all();
+      }
+
+      const byExactCid = new Map();
+      for (const row of convRows) {
+        const cidLower = String(row.lower_id || row.cascade_id || '').toLowerCase();
+        if (!cidLower) continue;
+        let meta = {};
+        try {
+          meta = JSON.parse(row.meta_json) || {};
+        } catch {}
+        const entry = {
+          ...meta,
+          steps: [],
+        };
+        byExactCid.set(row.cascade_id, entry);
+        byLower.set(cidLower, entry);
+      }
+
+      for (const sRow of stepRows) {
+        const target = byExactCid.get(sRow.cascade_id) || byLower.get(String(sRow.cascade_id || '').toLowerCase());
+        if (!target) continue;
+        let parsedAcc = null;
+        try {
+          parsedAcc = JSON.parse(sRow.accounting_json);
+        } catch {
+          continue;
+        }
+        let turnIdx = usedJsonExtract ? sRow.turn_index : null;
+        let turnPrompt = usedJsonExtract ? sRow.turn_prompt : '';
+        if (!usedJsonExtract && sRow.detail_json) {
+          try {
+            const det = JSON.parse(sRow.detail_json);
+            turnIdx = det?.turnIndex ?? null;
+            turnPrompt = det?.turnPromptClean || det?.turnPrompt || '';
+          } catch {}
+        }
+        const decoded = decodeAccountingTupleStep(parsedAcc, turnIdx, turnPrompt);
+        if (decoded) target.steps.push(decoded);
+      }
+      return true;
+    } catch (err) {
+      const msg = String(err?.message || '');
+      if (attempt < 2 && /SQLITE_BUSY|database is locked/i.test(msg)) continue;
+      return false;
+    } finally {
+      try { db?.close(); } catch {}
+    }
+  }
+  return false;
+}
+
+function loadNormalizedEntries({ trajSqliteFile, trajCacheFile }) {
+  const trajBakFile = `${trajCacheFile}.bak`;
+  let sig = '';
+  for (const p of [trajSqliteFile, `${trajSqliteFile}-wal`, trajCacheFile, ...DEEP_STATS_CANDIDATES]) {
+    try {
+      if (p && existsSync(p)) {
         const st = statSync(p);
-        sig += `${p}:${st.mtimeMs}:${st.size}|`;
+        sig += `${p}:${Math.floor(st.mtimeMs)}:${st.size}|`;
       }
     } catch {}
   }
   if (sig && sig === trajMemo.sig) return trajMemo.entries;
 
-  const rawCache = loadJsonSafe(trajCacheFile, {}) || {};
   const byLower = new Map();
-  for (const [rawId, entry] of Object.entries(rawCache)) {
-    const cidLower = String(rawId || '').toLowerCase();
-    if (!cidLower || !entry || typeof entry !== 'object') continue;
-    const prev = byLower.get(cidLower);
-    if (!prev || (entry.steps?.length || 0) > (prev.steps?.length || 0)) {
-      byLower.set(cidLower, entry);
+  const loadedFromSqlite = readSqliteTrajectoryEntries(trajSqliteFile, byLower);
+
+  const jsonFallbackPath = existsSync(trajCacheFile)
+    ? trajCacheFile
+    : (!loadedFromSqlite && existsSync(trajBakFile) ? trajBakFile : '');
+
+  if (jsonFallbackPath) {
+    const rawCache = loadJsonSafe(jsonFallbackPath, {}) || {};
+    for (const [rawId, entry] of Object.entries(rawCache)) {
+      const cidLower = String(rawId || '').toLowerCase();
+      if (!cidLower || !entry || typeof entry !== 'object') continue;
+      const prev = byLower.get(cidLower);
+      if (!prev || (entry.steps?.length || 0) > (prev.steps?.length || 0)) {
+        byLower.set(cidLower, entry);
+      }
     }
   }
 
@@ -1560,18 +1956,31 @@ export async function buildLedgerSnapshot({
   const nowMs = Date.now();
   const umPluginDir = discoverUsageMonitorPluginDir(GEMINI_BASE_DIR);
   const umDataDir = resolveUsageMonitorDataDir(GEMINI_BASE_DIR);
+  const trajSqliteFile = join(umDataDir, 'trajectory_store.sqlite');
   const trajCacheFile = join(umDataDir, 'trajectory_usage_cache.json');
   const cliSnapFile = join(umDataDir, 'cli-status-snapshot.json');
 
-  const [hostStatus, config, catalog, diskEntries, convExtraMeta] = await Promise.all([
+  const [hostStatus, config, catalog, convExtraMeta, updater] = await Promise.all([
     refreshHostUserStatus(forceHostRefresh),
     Promise.resolve(loadLedgerConfig()),
     Promise.resolve(getActiveCatalog(umPluginDir, umDataDir)),
-    Promise.resolve(loadNormalizedEntries(trajCacheFile)),
     loadConversationExtraMeta(forceHostRefresh),
+    getUpdaterMod().catch(() => null),
   ]);
 
-  const umLive = await fetchLiveUsageMonitorOverlay(diskEntries, forceHostRefresh);
+  if (updater) {
+    const curUpd = updater.getUpdateSnapshot();
+    if (!curUpd.updating && (curUpd.checkedAtMs === 0 || nowMs - curUpd.checkedAtMs > 15 * 60 * 1000)) {
+      void updater.maybeRunBackgroundUpdateCycle({
+        autoInstall: Boolean(config?.displayPrefs?.autoInstallUpdates),
+      });
+    }
+  }
+
+  // Trigger usage-monitor live scan first so any newly completed step is flushed to SQLite WAL before we read diskEntries
+  const preEntries = loadNormalizedEntries({ trajSqliteFile, trajCacheFile });
+  const umLive = await fetchLiveUsageMonitorOverlay(preEntries, forceHostRefresh);
+  const diskEntries = loadNormalizedEntries({ trajSqliteFile, trajCacheFile });
   const mergedMap = new Map(diskEntries.map((e) => [e.cid, e]));
   for (const [cid, liveEntry] of umLive.overlayByCid.entries()) {
     const prev = mergedMap.get(cid);
@@ -2206,7 +2615,12 @@ export async function buildLedgerSnapshot({
 
   let cacheMtimeMs = 0;
   try {
-    if (existsSync(trajCacheFile)) cacheMtimeMs = Math.floor(statSync(trajCacheFile).mtimeMs);
+    for (const p of [trajSqliteFile, `${trajSqliteFile}-wal`, trajCacheFile]) {
+      if (existsSync(p)) {
+        const m = Math.floor(statSync(p).mtimeMs);
+        if (m > cacheMtimeMs) cacheMtimeMs = m;
+      }
+    }
   } catch {}
 
   const presetsFormatted = {};
@@ -2235,8 +2649,7 @@ export async function buildLedgerSnapshot({
   let uiVersion = '1';
   try {
     let maxUi = 0;
-    for (const f of ['index.html', 'styles.css', 'app.js']) {
-      const p = join(HERE, f);
+    for (const p of [PLUGIN_MANIFEST_FILE, join(HERE, 'index.html'), join(HERE, 'styles.css'), join(HERE, 'app.js')]) {
       if (existsSync(p)) {
         const m = Math.floor(statSync(p).mtimeMs || 0);
         if (m > maxUi) maxUi = m;
@@ -2245,9 +2658,23 @@ export async function buildLedgerSnapshot({
     if (maxUi > 0) uiVersion = String(maxUi);
   } catch {}
 
+  const ownManifest = loadJsonSafe(PLUGIN_MANIFEST_FILE, null);
+  const pluginVersion = String(ownManifest?.version || '1.6.0').trim();
+  const rawUpdateSnap = updater
+    ? updater.getUpdateSnapshot()
+    : {
+        currentVersion: pluginVersion,
+        latestVersion: pluginVersion,
+        hasUpdate: false,
+        updating: false,
+        checkedAtMs: 0,
+        releaseUrl: 'https://github.com/TheMGVA/antigravity-usage-ledger/releases/latest',
+        error: null,
+      };
+
   const umManifest = loadJsonSafe(join(umPluginDir, 'plugin.json'), null);
   const umPluginInstalled = Boolean(umManifest && existsSync(join(umPluginDir, 'plugin.json')));
-  const umCacheExists = existsSync(trajCacheFile);
+  const umCacheExists = existsSync(trajSqliteFile) || existsSync(trajCacheFile);
 
   // Real-time cross-plugin reconciliation against live usage-monitor /api/telemetry presets
   const liveUmPresets = umLive.presets && typeof umLive.presets === 'object' ? umLive.presets : null;
@@ -2268,6 +2695,11 @@ export async function buildLedgerSnapshot({
 
   return {
     uiVersion,
+    pluginVersion,
+    pluginUpdate: {
+      ...rawUpdateSnap,
+      autoInstallUpdates: Boolean(config?.displayPrefs?.autoInstallUpdates),
+    },
     timestampMs: nowMs,
     hasUsageMonitorCache: umCacheExists,
     usageMonitorStatus: {

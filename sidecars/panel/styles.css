@@ -123,11 +123,117 @@ html, body {
   gap: 1px;
 }
 
+.brand-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
 .brand-title {
   font-weight: 700;
   font-size: 14.5px;
   letter-spacing: -0.01em;
   line-height: 1.2;
+}
+
+.ver-pill {
+  appearance: none;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-subtle);
+  color: var(--fg-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 6.5px;
+  border-radius: 999px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-variant-numeric: tabular-nums;
+  transition: all 0.15s ease;
+}
+
+.ver-pill:hover,
+.ver-pill.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--gemini-bg);
+}
+
+.ver-pill.has-update {
+  border-color: rgba(16, 185, 129, 0.45);
+  color: var(--ok);
+  background: rgba(16, 185, 129, 0.12);
+}
+
+.ver-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ok);
+  box-shadow: 0 0 6px var(--ok);
+}
+
+.btn-update-cta {
+  background: rgba(16, 185, 129, 0.15);
+  border-color: rgba(16, 185, 129, 0.45);
+  color: var(--ok);
+  font-weight: 650;
+}
+
+.btn-update-cta:hover {
+  background: rgba(16, 185, 129, 0.24);
+  border-color: var(--ok);
+}
+
+.tag-update-ready {
+  background: rgba(16, 185, 129, 0.14);
+  color: var(--ok);
+  border-color: rgba(16, 185, 129, 0.36);
+}
+
+.update-panel {
+  background: var(--bg-surface);
+  border: 1px solid var(--gemini-border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  box-shadow: var(--shadow-card);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.update-panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.update-panel-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  font-weight: 650;
+  font-size: 13px;
+}
+
+.update-panel-meta {
+  font-size: 12px;
+  color: var(--fg-secondary);
+  margin-top: 3px;
+}
+
+.update-panel-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-subtle);
 }
 
 .brand-sub {
